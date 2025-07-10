@@ -1,251 +1,246 @@
+// sign.tsx
 'use client'
 
-import React, { useRef, useEffect, useState, useMemo } from 'react'
+import React, { useRef, useState, useMemo, useCallback } from 'react'
 import { useFrame } from '@react-three/fiber'
+import { Text } from '@react-three/drei'
 import * as THREE from 'three'
+import { TextLineProps, SignProps, SignStyle } from '../types/types'
 
-// --- INTERFACCE PER LA PERSONALIZZAZIONE ---
-
-/** Opzioni per un materiale THREE.js */
-type MaterialOptions = THREE.MeshStandardMaterialParameters
-
-/** Descrive la geometria e il materiale di una parte del cartello */
-interface SignPart {
-  geometry: THREE.BufferGeometry
-  material?: MaterialOptions
-  visible?: boolean
-  position?: [number, number, number]
-  rotation?: [number, number, number]
-}
-
-/** Proprietà per il contenuto web da visualizzare sul pannello */
-export interface WebContent {
-  html: string
-  width?: number
-  height?: number
-  backgroundColor?: string
-}
-
-/** Props principali del componente Sign */
-interface SignProps {
-  position: [number, number, number]
-  rotation?: [number, number, number]
-  scale?: number
-  webContent?: WebContent
+function TextLine({ text, position, fontSize, color, fontFamily, anchorX = 'center', maxWidth }: TextLineProps) {
+  const memoizedPosition = useMemo(() => position, [position[0], position[1], position[2]])
   
-  // Oggetti per personalizzare ogni parte del cartello
-  panel?: Partial<SignPart>
-  frame?: Partial<SignPart>
-  stick?: Partial<SignPart>
-  base?: Partial<SignPart>
+  return (
+    <Text
+      position={memoizedPosition}
+      fontSize={fontSize}
+      color={color}
+      font={fontFamily}
+      anchorX={anchorX}
+      anchorY="middle"
+      maxWidth={maxWidth}
+      textAlign={anchorX}
+      renderOrder={1}
+      material-toneMapped={false}
+    >
+      {text}
+    </Text>
+  )
+}
 
-  // Interazioni
-  onInteract?: () => void
-  onCameraMove?: (target: THREE.Vector3) => void
-  hoverEffect?: {
-    scale?: number
-    glowColor?: THREE.ColorRepresentation
+function splitTextIntoColumns(text: string | string[], maxLinesPerColumn: number): string[][] {
+  const lines = Array.isArray(text) ? text : text.split('\n')
+  const columns: string[][] = []
+
+  for (let i = 0; i < lines.length; i += maxLinesPerColumn) {
+    columns.push(lines.slice(i, i + maxLinesPerColumn))
   }
+
+  return columns
 }
-
-// --- HOOK PER LA TEXTURE WEB (Migliorato) ---
-
-function useWebTexture(content?: WebContent): THREE.CanvasTexture | null {
-  const [texture, setTexture] = useState<THREE.CanvasTexture | null>(null)
-
-  useEffect(() => {
-    if (!content || !content.html) {
-      texture?.dispose()
-      setTexture(null)
-      return
-    }
-
-    const { html, width = 1024, height = 576, backgroundColor = 'white' } = content
-    
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext('2d')
-    
-    const canvasTexture = new THREE.CanvasTexture(canvas)
-    canvasTexture.minFilter = THREE.LinearFilter
-    canvasTexture.magFilter = THREE.LinearFilter
-    canvasTexture.format = THREE.RGBAFormat
-
-    const image = new Image()
-
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-        <foreignObject width="100%" height="100%">
-          <div xmlns="http://www.w3.org/1999/xhtml" style="width: 100%; height: 100%; background-color: ${backgroundColor};">
-            ${html}
-          </div>
-        </foreignObject>
-      </svg>
-    `
-    // Usare btoa per evitare problemi con caratteri speciali nell'URL
-    const url = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)))
-
-    image.onload = () => {
-      if (context) {
-        context.clearRect(0, 0, width, height)
-        context.drawImage(image, 0, 0, width, height)
-        canvasTexture.needsUpdate = true
-      }
-    }
-    image.onerror = (err) => {
-      console.error("Errore nel caricamento dell'immagine SVG per la texture:", err)
-    }
-    image.src = url
-
-    setTexture(canvasTexture)
-
-    return () => {
-      canvasTexture.dispose()
-      image.onload = null // Pulisci i listener
-      image.onerror = null
-    }
-  }, [content])
-
-  return texture
-}
-
-// --- COMPONENTE PRINCIPALE ---
 
 export function Sign({
   position,
   rotation = [0, 0, 0],
   scale = 1,
-  webContent,
-  panel,
-  frame,
-  stick,
-  base,
+  content,
+  style = {},
   onInteract,
   onCameraMove,
-  hoverEffect = { scale: 1.05, glowColor: 0xffffff },
 }: SignProps) {
   const groupRef = useRef<THREE.Group>(null!)
   const [isHovered, setIsHovered] = useState(false)
+  const [isVisible, setIsVisible] = useState(true) // Inizia visibile per evitare flash
+  
+  // Usa ref per evitare re-render frequenti
+  const lastVisibilityCheck = useRef(0)
+  const lastDistanceCheck = useRef(0)
+  
+  const memoizedPosition = useMemo(() => new THREE.Vector3(...position), [position[0], position[1], position[2]])
+  const memoizedRotation = useMemo(() => rotation, [rotation[0], rotation[1], rotation[2]])
 
-  const webTexture = useWebTexture(webContent)
+  const defaultStyle: Required<SignStyle> = useMemo(() => ({
+    titleColor: style.titleColor || '#FFFFFF',
+    bodyColor: style.bodyColor || '#E0E0E0',
+    footerColor: style.footerColor || '#A0A0A0',
+    backgroundColor: style.backgroundColor || '#2C1810',
+    fontFamily: style.fontFamily || '/fonts/monobit.ttf', 
+    panelWidth: style.panelWidth || 4,
+    panelHeight: style.panelHeight || 2.5,
+  }), [style])
 
-  // --- COSTRUZIONE DEL CARTELLO DINAMICA ---
-
-  const parts = useMemo(() => {
-    const s = scale // Abbreviazione per la leggibilità
-
-    // Geometrie di default, possono essere sovrascritte
-    const defaultGeometries = {
-      panel: new THREE.BoxGeometry(4 * s, 2.25 * s, 0.05 * s),
-      frame: new THREE.BoxGeometry(4.2 * s, 2.45 * s, 0.1 * s),
-      stick: new THREE.CylinderGeometry(0.1 * s, 0.1 * s, 2.5 * s, 12),
-      base: new THREE.CylinderGeometry(0.4 * s, 0.3 * s, 0.4 * s, 12),
-    }
-
-    // Materiali di default, possono essere sovrascritti
-    const defaultMaterials = {
-      // FIX: La texture ora è una mappa emissiva per essere sempre luminosa.
-      panel: { 
-        emissiveMap: webTexture, // La texture emette luce
-        emissive: 0xffffff,      // Colore della luce emessa (bianco per non alterare i colori)
-        color: 0x000000,         // Colore base nero per non riflettere la luce della scena
-        polygonOffset: true,     // Risolve lo z-fighting in modo robusto
-        polygonOffsetFactor: -1,
-      },
-      frame: { color: 0x332211 },
-      stick: { color: 0x5C3D2E },
-      base: { color: 0x555555 },
-    }
-    
-    // Posizioni di default
-    const defaultPositions: Record<string, [number, number, number]> = {
-        // FIX: Rimosse le modifiche manuali per lo z-fighting
-        panel: [0, 1.375 * s, 0.025 * s+.01],
-        frame: [0, 1.375 * s, 0],
-        stick: [0, 0, -0.1],
-        base: [0, -1.25 * s, 0],
-    }
-
-    // Helper per creare una parte del cartello
-    const createPart = (name: 'panel' | 'frame' | 'stick' | 'base', customPart?: Partial<SignPart>): SignPart => ({
-      geometry: customPart?.geometry || defaultGeometries[name],
-      material: { ...defaultMaterials[name], ...customPart?.material },
-      visible: customPart?.visible ?? true,
-      position: customPart?.position || defaultPositions[name],
-      rotation: customPart?.rotation || [0,0,0],
-    })
+  const dimensions = useMemo(() => {
+    const scaledWidth = defaultStyle.panelWidth * scale
+    const scaledHeight = defaultStyle.panelHeight * scale
 
     return {
-      panel: createPart('panel', panel),
-      frame: createPart('frame', frame),
-      stick: createPart('stick', stick),
-      base: createPart('base', base),
+      scaledWidth,
+      scaledHeight,
+      titleY: scaledHeight * 0.35,
+      bodyStartY: scaledHeight * 0.1,
+      footerY: -scaledHeight * 0.35,
+      titleFontSize: 0.15 * scale,
+      bodyFontSize: 0.1 * scale,
+      footerFontSize: 0.08 * scale,
     }
-  }, [scale, webTexture, panel, frame, stick, base])
+  }, [defaultStyle.panelWidth, defaultStyle.panelHeight, scale])
 
-  // Cleanup delle risorse
-  useEffect(() => {
-    return () => {
-      Object.values(parts).forEach(part => part.geometry.dispose())
+  const bodyColumns = useMemo(() => {
+    const maxLinesPerColumn = 8
+    return splitTextIntoColumns(content.body, maxLinesPerColumn)
+  }, [content.body])
+
+  // Geometrie memoizzate
+  const geometries = useMemo(() => ({
+    panel: new THREE.BoxGeometry(dimensions.scaledWidth, dimensions.scaledHeight, 0.05 * scale),
+    frame: new THREE.BoxGeometry(dimensions.scaledWidth * 1.1, dimensions.scaledHeight * 1.1, 0.08 * scale),
+    stick: new THREE.CylinderGeometry(0.05 * scale, 0.05 * scale, 2 * scale, 8),
+  }), [dimensions.scaledWidth, dimensions.scaledHeight, scale])
+
+  // Frame ottimizzato con throttling
+  useFrame((state) => {
+    if (!groupRef.current) return
+    
+    const currentTime = state.clock.elapsedTime
+    
+    // Throttle controllo visibilità a 5fps
+    if (currentTime - lastVisibilityCheck.current > 0.2) {
+      const distance = state.camera.position.distanceTo(groupRef.current.position)
+      const newVisibility = distance < 25
+      
+      if (newVisibility !== isVisible) {
+        setIsVisible(newVisibility)
+      }
+      
+      lastVisibilityCheck.current = currentTime
     }
-  }, [parts])
-
-  // Animazione di hover
-  useFrame((state, delta) => {
-    if (groupRef.current) {
-      const targetScale = isHovered ? (hoverEffect.scale || 1) : 1
-      groupRef.current.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), delta * 8)
+    
+    // Animazione scala hover più dolce
+    if (currentTime - lastDistanceCheck.current > 0.016) {
+      const targetScale = isHovered ? 1.03 : 1
+      const currentScale = groupRef.current.scale.x
+      
+      if (Math.abs(currentScale - targetScale) > 0.001) {
+        groupRef.current.scale.lerp(
+          new THREE.Vector3(targetScale, targetScale, targetScale),
+          0.1
+        )
+      }
+      
+      lastDistanceCheck.current = currentTime
     }
   })
 
-  const handleClick = (event: any) => {
+  // Handler ottimizzati
+  const handleClick = useCallback((event: any) => {
     event.stopPropagation()
-    if (onCameraMove) {
-      const targetPos = new THREE.Vector3().setFromMatrixPosition(groupRef.current.matrixWorld)
-      targetPos.y += 1.375 * scale
-      onCameraMove(targetPos)
-    }
-    if (onInteract) onInteract()
-  }
+    // Rimuovi l'animazione automatica della camera - lascia che sia l'utente a controllare
+    onInteract?.()
+  }, [onInteract])
+
+  const handlePointerEnter = useCallback((e: any) => {
+    e.stopPropagation()
+    setIsHovered(true)
+  }, [])
+
+  const handlePointerLeave = useCallback((e: any) => {
+    e.stopPropagation()
+    setIsHovered(false)
+  }, [])
+
+  // Componenti memoizzati
+  const textContent = useMemo(() => (
+    <group visible={isVisible} position={[0, 0, 0.03 * scale]}>
+      <TextLine
+        text={content.title}
+        position={[0, dimensions.titleY, 0]}
+        fontSize={dimensions.titleFontSize}
+        color={defaultStyle.titleColor}
+        fontFamily={defaultStyle.fontFamily}
+        anchorX="center"
+        maxWidth={dimensions.scaledWidth * 0.9}
+      />
+
+      {bodyColumns.map((column, colIndex) => {
+        const columnX = bodyColumns.length > 1
+          ? (dimensions.scaledWidth * 0.4) - (colIndex * dimensions.scaledWidth * 0.4)
+          : dimensions.scaledWidth * 0.4
+
+        return column.map((line, lineIndex) => (
+          <TextLine
+            key={`${colIndex}-${lineIndex}`}
+            text={Array.isArray(content.body) ? `• ${line}` : line}
+            position={[columnX, dimensions.bodyStartY - (lineIndex * dimensions.bodyFontSize * 1.5), 0]}
+            fontSize={dimensions.bodyFontSize}
+            color={defaultStyle.bodyColor}
+            fontFamily={defaultStyle.fontFamily}
+            anchorX="right"
+            maxWidth={dimensions.scaledWidth * 0.45}
+          />
+        ))
+      })}
+
+      {content.footer && (
+        <TextLine
+          text={content.footer}
+          position={[-dimensions.scaledWidth * 0.4, dimensions.footerY, 0]}
+          fontSize={dimensions.footerFontSize}
+          color={defaultStyle.footerColor}
+          fontFamily={defaultStyle.fontFamily}
+          anchorX="left"
+          maxWidth={dimensions.scaledWidth * 0.8}
+        />
+      )}
+    </group>
+  ), [isVisible, scale, content, dimensions, defaultStyle, bodyColumns])
+
+  const materials = useMemo(() => ({
+    stick: <meshStandardMaterial color="#3E2723" roughness={0.8} />,
+    frame: <meshStandardMaterial color="#5D4037" roughness={0.7} />,
+    panel: <meshStandardMaterial color={defaultStyle.backgroundColor} />,
+  }), [defaultStyle.backgroundColor])
 
   return (
     <group
       ref={groupRef}
-      position={position}
-      rotation={rotation}
-      scale={scale}
-      onPointerEnter={(e) => { e.stopPropagation(); setIsHovered(true) }}
-      onPointerLeave={(e) => { e.stopPropagation(); setIsHovered(false) }}
+      position={memoizedPosition}
+      rotation={memoizedRotation}
       onClick={handleClick}
+      onPointerEnter={handlePointerEnter}
+      onPointerLeave={handlePointerLeave}
     >
-      {/* Renderizza ogni parte se è visibile */}
-      {Object.values(parts).map((part, index) =>
-        part.visible ? (
-          <mesh
-            key={index}
-            geometry={part.geometry}
-            position={part.position}
-            rotation={part.rotation}
-            castShadow
-            receiveShadow
-          >
-            <meshStandardMaterial {...part.material} />
-          </mesh>
-        ) : null
-      )}
+      <mesh 
+        geometry={geometries.stick} 
+        position={[0, -dimensions.scaledHeight * 0.5 - scale, 0]} 
+        castShadow 
+        receiveShadow
+      >
+        {materials.stick}
+      </mesh>
 
-      {/* Effetto glow quando hover */}
-      {isHovered && hoverEffect.glowColor && (
-         <mesh position={parts.frame.position}>
-            <boxGeometry args={[4.4 * scale, 2.65 * scale, 0.12 * scale]} />
-            <meshBasicMaterial
-                color={hoverEffect.glowColor}
-                transparent
-                opacity={0.3}
-                side={THREE.BackSide}
-            />
-        </mesh>
+      <mesh 
+        geometry={geometries.frame} 
+        position={[0, 0, -0.02 * scale]} 
+        castShadow 
+        receiveShadow
+      >
+        {materials.frame}
+      </mesh>
+
+      <mesh geometry={geometries.panel} castShadow receiveShadow>
+        {materials.panel}
+      </mesh>
+
+      {textContent}
+
+      {isHovered && (
+        <>
+          <mesh position={[0, 0, -0.04 * scale]}>
+            <boxGeometry args={[dimensions.scaledWidth * 1.15, dimensions.scaledHeight * 1.15, 0.1 * scale]} />
+            <meshBasicMaterial color="#FFD700" transparent opacity={0.2} side={THREE.BackSide} />
+          </mesh>
+          <pointLight position={[0, 0, 0.5 * scale]} intensity={0.2} distance={3} color="#FFD700" />
+        </>
       )}
     </group>
   )

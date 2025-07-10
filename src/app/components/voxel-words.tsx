@@ -6,309 +6,155 @@ import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react'
 import { createNoise2D, NoiseFunction2D } from 'simplex-noise'
 import { BufferGeometryUtils } from 'three/examples/jsm/Addons.js'
 import { useThree, useFrame } from '@react-three/fiber'
-import { Sign, WebContent } from './sign'
+import { Sign } from './sign'
+import { VoxelWorldRef, VoxelWorldProps, BlockData, SignData, Block, VoxelWorldInstance } from '../types/types'
 
 const WORLD_SIZE = 128
 const MAX_HEIGHT = 40
 const WATER_LEVEL = 12
 const BEACH_HEIGHT = WATER_LEVEL + 3
 const NOISE_SCALE = 30
-const OCTAVES = 5
+const OCTAVES = 2
 const LACUNARITY = 2.0
 const PERSISTENCE = 0.5
 const TERRAIN_OFFSET = -2
 
-// Shader per l'acqua
-const waterVertexShader = `
-  varying vec2 vUv;
-  varying vec3 vWorldPosition;
-  
-  void main() {
-    vUv = uv;
-    vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-    vWorldPosition = worldPosition.xyz;
-    
-    gl_Position = projectionMatrix * viewMatrix * worldPosition;
-  }
-`
-
-const waterFragmentShader = `
-  uniform vec3 waterColor;
-  uniform vec3 deepWaterColor;
-  varying vec2 vUv;
-  varying vec3 vWorldPosition;
-  
-  void main() {
-    // Crea un gradiente basato sulla profondità
-    float depth = smoothstep(0.0, 10.0, vWorldPosition.y);
-    vec3 color = mix(deepWaterColor, waterColor, depth);
-    
-    // Aggiungi variazione nel colore basata sulla posizione
-    float noise = sin(vWorldPosition.x * 0.05) * 
-                  cos(vWorldPosition.z * 0.05) * 0.05 + 0.95;
-    color *= noise;
-    
-    // Trasparenza fissa
-    float alpha = 0.85;
-    
-    gl_FragColor = vec4(color, alpha);
-  }
-`
-
-// Shader per i blocchi con illuminazione migliorata
-const blockVertexShader = `
+// Shader leggeri per migliorare l'aspetto visivo
+const vertexShader = `
   varying vec3 vNormal;
-  varying vec3 vWorldPosition;
+  varying vec3 vPosition;
   varying vec2 vUv;
   
   void main() {
     vUv = uv;
     vNormal = normalize(normalMatrix * normal);
-    vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-    vWorldPosition = worldPosition.xyz;
-    gl_Position = projectionMatrix * viewMatrix * worldPosition;
+    vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `
 
-const blockFragmentShader = `
+const fragmentShader = `
   uniform vec3 baseColor;
-  uniform vec3 sunDirection;
+  uniform vec3 lightDirection;
   uniform float ambientStrength;
   varying vec3 vNormal;
-  varying vec3 vWorldPosition;
+  varying vec3 vPosition;
   varying vec2 vUv;
   
   void main() {
-    // Illuminazione di base
     vec3 normal = normalize(vNormal);
-    float dotNL = dot(normal, sunDirection);
-    float lighting = max(dotNL, 0.0) + ambientStrength;
     
-    // Aggiungi un po' di variazione nel colore basata sulla posizione
-    vec3 color = baseColor;
-    float variation = sin(vWorldPosition.x * 0.1) * sin(vWorldPosition.z * 0.1) * 0.05 + 0.95;
-    color *= variation;
+    // Illuminazione direzionale semplice
+    float NdotL = max(dot(normal, lightDirection), 0.0);
+    float diffuse = NdotL * 0.8 + ambientStrength;
     
-    // Aggiungi ombreggiatura per i lati
-    if (abs(normal.y) < 0.5) {
-      color *= 0.85;
+    // Variazione di colore basata sulla posizione per texturing procedurale
+    float noise = sin(vPosition.x * 0.5) * sin(vPosition.z * 0.5) * 0.1 + 0.9;
+    vec3 color = baseColor * noise;
+    
+    // Ombreggiatura per facce laterali
+    if (abs(normal.y) < 0.9) {
+      color *= 0.8;
     }
     
-    // Applica l'illuminazione
-    vec3 finalColor = color * lighting;
+    // Applica illuminazione
+    color *= diffuse;
     
-    gl_FragColor = vec4(finalColor, 1.0);
+    gl_FragColor = vec4(color, 1.0);
   }
 `
 
-// Cache dei materiali con shaders
-const createMaterials = () => {
-  const sunDirection = new THREE.Vector3(0.5, 0.8, 0.3).normalize()
+// Shader per l'acqua con riflessi leggeri
+const waterVertexShader = `
+  varying vec2 vUv;
+  varying vec3 vPosition;
   
-  return {
-    grass: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0x6a994e) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.4 }
-      }
-    }),
-    dirt: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0x78552B) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.4 }
-      }
-    }),
-    stone: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0x666666) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.35 }
-      }
-    }),
-    sand: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0xc2b280) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.45 }
-      }
-    }),
-    snow: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0xffffff) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.5 }
-      }
-    }),
-    rock: new THREE.ShaderMaterial({
-      vertexShader: blockVertexShader,
-      fragmentShader: blockFragmentShader,
-      uniforms: {
-        baseColor: { value: new THREE.Color(0x78552B) },
-        sunDirection: { value: sunDirection },
-        ambientStrength: { value: 0.3 }
-      }
-    })
+  void main() {
+    vUv = uv;
+    vPosition = (modelViewMatrix * vec4(position, 1.0)).xyz;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
-}
+`
 
-// Tipo per la callback di caricamento
-type LoadingCallback = (progress: number) => void
+const waterFragmentShader = `
+  uniform float time;
+  varying vec2 vUv;
+  varying vec3 vPosition;
+  
+  void main() {
+    // Onde semplici
+    float wave = sin(vPosition.x * 0.1 + time) * sin(vPosition.z * 0.1 + time * 0.7) * 0.02;
+    
+    // Colore acqua con gradiente
+    vec3 waterColor = mix(vec3(0.2, 0.4, 0.8), vec3(0.4, 0.6, 0.9), wave + 0.5);
+    
+    gl_FragColor = vec4(waterColor, 0.8);
+  }
+`
 
-// Tipo per cartello
-export interface SignData {
-    id: string
-    position: [number, number, number]
-    rotation?: [number, number, number]
-    scale?: number
-    webContent?: WebContent
-}
-
-// Tipo per info blocco
-export interface BlockInfo {
-    position: { x: number; y: number; z: number }
-    type: string
-    worldPosition: THREE.Vector3
-}
-
-// Classe Block con metodi
-export class Block {
-    private position: { x: number; y: number; z: number }
-    private type: string
-    private worldPosition: THREE.Vector3
-    private worldRef: VoxelWorldInstance | null
-
-    constructor(
-        position: { x: number; y: number; z: number },
-        type: string,
-        worldPosition: THREE.Vector3,
-        worldRef: VoxelWorldInstance | null
-    ) {
-        this.position = position
-        this.type = type
-        this.worldPosition = worldPosition
-        this.worldRef = worldRef
-    }
-
-    getPosition() {
-        return { ...this.position }
-    }
-
-    getType() {
-        return this.type
-    }
-
-    getWorldPosition() {
-        return this.worldPosition.clone()
-    }
-
-    remove() {
-        if (this.worldRef) {
-            this.worldRef.removeBlock(this.position)
-        }
-    }
-
-    change(newType: string) {
-        if (this.worldRef && newType !== 'water') {
-            this.worldRef.changeBlock(this.position, newType)
-            this.type = newType
-        }
-    }
-
-    setColor(color: string | number) {
-        if (this.worldRef) {
-            this.worldRef.setBlockColor(this.position, color)
-        }
-    }
-
-    setOutline(color: string | number, emissiveIntensity: number) {
-        if (this.worldRef) {
-            this.worldRef.setBlockOutline(this.position, color, emissiveIntensity)
-        }
-    }
-
-    removeOutline() {
-        if (this.worldRef) {
-            this.worldRef.removeBlockOutline(this.position)
-        }
+// Materiali con shader personalizzati leggeri
+const createMaterials = () => {
+    const lightDirection = new THREE.Vector3(0.5, 0.8, 0.3).normalize()
+    
+    return {
+        grass: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0x6a994e) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.3 }
+            }
+        }),
+        dirt: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0x8B4513) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.25 }
+            }
+        }),
+        stone: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0x696969) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.2 }
+            }
+        }),
+        sand: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0xF4A460) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.4 }
+            }
+        }),
+        snow: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0xFFFAFA) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.6 }
+            }
+        }),
+        rock: new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                baseColor: { value: new THREE.Color(0x654321) },
+                lightDirection: { value: lightDirection },
+                ambientStrength: { value: 0.15 }
+            }
+        })
     }
 }
 
-// Tipo per callback click
-type BlockClickCallback = (block: Block | null) => void
-type SignCameraMoveCallback = (target: THREE.Vector3) => void
-
-interface VoxelWorldProps {
-    onLoadingProgress?: LoadingCallback
-    onBlockClick?: BlockClickCallback
-    onSignCameraMove?: SignCameraMoveCallback
-}
-
-export interface VoxelWorldRef {
-    regenerate: () => void
-    getSeed: () => number
-    getRandomSurfaceBlocks: (count: number) => Block[]
-    getRandomBlock: () => Block | null
-    getBlock: (x: number, y: number, z: number) => Block | null
-    isBlockVisible:(target: THREE.Vector3,camera: THREE.Camera) => boolean
-    addSign: (signData: SignData) => void
-    removeSign: (signId: string) => void
-    getSigns: () => SignData[]
-}
-
-// Interface per i metodi interni
-interface VoxelWorldInstance {
-    removeBlock: (position: { x: number; y: number; z: number }) => void
-    changeBlock: (position: { x: number; y: number; z: number }, newType: string) => void
-    addBlock: (position: { x: number; y: number; z: number }, type: string) => void
-    setBlockColor: (position: { x: number; y: number; z: number }, color: string | number) => void
-    setBlockOutline: (position: { x: number; y: number; z: number }, color: string | number, emissiveIntensity: number) => void
-    removeBlockOutline: (position: { x: number; y: number; z: number }) => void
-}
-
-// Struttura per memorizzare info sui blocchi
-interface BlockData {
-    position: { x: number; y: number; z: number }
-    type: string
-    color?: string | number
-    outline?: {
-        color: string | number
-        emissiveIntensity: number
-    }
-}
-
-// Funzione per smooth noise con interpolazione
-function smoothNoise(noise2D: NoiseFunction2D, x: number, z: number): number {
-    const intX = Math.floor(x)
-    const intZ = Math.floor(z)
-    const fracX = x - intX
-    const fracZ = z - intZ
-
-    const a = noise2D(intX, intZ)
-    const b = noise2D(intX + 1, intZ)
-    const c = noise2D(intX, intZ + 1)
-    const d = noise2D(intX + 1, intZ + 1)
-
-    const fx = fracX * fracX * (3.0 - 2.0 * fracX)
-    const fz = fracZ * fracZ * (3.0 - 2.0 * fracZ)
-
-    const x1 = a * (1 - fx) + b * fx
-    const x2 = c * (1 - fx) + d * fx
-
-    return x1 * (1 - fz) + x2 * fz
-}
-
+// Rumore semplificato
 function getFractalNoise(noise2D: NoiseFunction2D, x: number, z: number): number {
     let total = 0
     let frequency = 1
@@ -316,14 +162,13 @@ function getFractalNoise(noise2D: NoiseFunction2D, x: number, z: number): number
     let maxValue = 0
 
     for (let i = 0; i < OCTAVES; i++) {
-        total += smoothNoise(noise2D, x * frequency, z * frequency) * amplitude
+        total += noise2D(x * frequency, z * frequency) * amplitude
         maxValue += amplitude
         amplitude *= PERSISTENCE
         frequency *= LACUNARITY
     }
 
-    const normalized = total / maxValue
-    return Math.tanh(normalized * 1.5) / Math.tanh(1.5)
+    return total / maxValue
 }
 
 function getBlockType(y: number, surfaceHeight: number): string {
@@ -343,45 +188,51 @@ function isBlockVisible(x: number, y: number, z: number, heightMap: number[][]):
     if (y === 0 || y === MAX_HEIGHT - 1) return true
 
     const surfaceHeight = heightMap[x][z]
+    if (y > surfaceHeight || y === surfaceHeight) return true
 
-    if (y > surfaceHeight) return true
-    if (y === surfaceHeight) return true
-
-    if (y > heightMap[x - 1][z] || y > heightMap[x + 1][z] ||
-        y > heightMap[x][z - 1] || y > heightMap[x][z + 1]) {
-        return true
-    }
-
-    return false
+    return y > heightMap[x - 1][z] || y > heightMap[x + 1][z] ||
+           y > heightMap[x][z - 1] || y > heightMap[x][z + 1]
 }
 
-// Componente Water semplificato senza animazione
-function WaterMesh({ waterMesh }: { waterMesh: THREE.Mesh }) {
-    return <primitive object={waterMesh} />
-}
+const MemoizedSign = React.memo(({ signData, onSignCameraMove }: { 
+  signData: SignData, 
+  onSignCameraMove?: (target: THREE.Vector3) => void 
+}) => (
+    <Sign
+        position={signData.position}
+        rotation={signData.rotation}
+        scale={signData.scale}
+        content={signData.content}
+        style={signData.style}
+        onCameraMove={onSignCameraMove}
+    />
+), (prev, next) => prev.signData.id === next.signData.id && 
+                  JSON.stringify(prev.signData) === JSON.stringify(next.signData))
 
 export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
     ({ onLoadingProgress, onBlockClick, onSignCameraMove }, ref) => {
         const groupRef = useRef<THREE.Group>(null!)
         const [worldData, setWorldData] = useState<Map<string, BlockData>>(new Map())
+        const worldDataRef = useRef<Map<string, BlockData>>(new Map())
         const [meshes, setMeshes] = useState<{ mesh: THREE.Mesh; type: string }[]>([])
         const [waterMesh, setWaterMesh] = useState<THREE.Mesh | null>(null)
-        const [outlineMeshes, setOutlineMeshes] = useState<Map<string, THREE.Mesh>>(new Map())
         const [isGenerating, setIsGenerating] = useState(false)
         const [seed, setSeed] = useState(1)
         const [needsFullRebuild, setNeedsFullRebuild] = useState(true)
         const [surfaceBlocksData, setSurfaceBlocksData] = useState<BlockData[]>([])
         const [signs, setSigns] = useState<SignData[]>([])
+        const signsRef = useRef<SignData[]>([])
+
+        useEffect(() => {
+            worldDataRef.current = worldData
+            signsRef.current = signs
+        }, [worldData, signs])
+
         const materials = useMemo(() => createMaterials(), [])
-
-        // Three.js context
         const { gl, camera } = useThree()
-
-        // Raycaster per il picking
         const raycaster = useMemo(() => new THREE.Raycaster(), [])
         const mouse = useMemo(() => new THREE.Vector2(), [])
 
-        // Metodi per modificare i blocchi
         const worldInstance: VoxelWorldInstance = useMemo(() => ({
             removeBlock: (position: { x: number; y: number; z: number }) => {
                 const key = `${position.x},${position.y},${position.z}`
@@ -392,13 +243,8 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 })
                 setNeedsFullRebuild(true)
             },
-
             addBlock: (position: { x: number; y: number; z: number }, type: string) => {
-                if (type === 'water') {
-                    console.warn('Non puoi aggiungere blocchi d\'acqua manualmente')
-                    return
-                }
-
+                if (type === 'water') return
                 const key = `${position.x},${position.y},${position.z}`
                 setWorldData(prev => {
                     const newData = new Map(prev)
@@ -409,13 +255,8 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 })
                 setNeedsFullRebuild(true)
             },
-
             changeBlock: (position: { x: number; y: number; z: number }, newType: string) => {
-                if (newType === 'water') {
-                    console.warn('Non puoi cambiare blocchi in acqua')
-                    return
-                }
-                
+                if (newType === 'water') return
                 const key = `${position.x},${position.y},${position.z}`
                 setWorldData(prev => {
                     const newData = new Map(prev)
@@ -427,7 +268,6 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 })
                 setNeedsFullRebuild(true)
             },
-
             setBlockColor: (position: { x: number; y: number; z: number }, color: string | number) => {
                 const key = `${position.x},${position.y},${position.z}`
                 setWorldData(prev => {
@@ -440,91 +280,78 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 })
                 setNeedsFullRebuild(true)
             },
+            setBlockOutline: () => {},
+            removeBlockOutline: () => {}
+        }), []) // IMPORTANTE: Dependenze vuote per evitare ricreazioni
 
-            setBlockOutline: (position: { x: number; y: number; z: number }, color: string | number, emissiveIntensity: number) => {
-                const key = `${position.x},${position.y},${position.z}`
-                const block = worldData.get(key)
-                if (!block) return
+        const getBlockAtMouse = useCallback((clientX: number, clientY: number) => {
+            if (!groupRef.current) return null
 
-                setOutlineMeshes(prev => {
-                    const newOutlines = new Map(prev)
-                    const existingOutline = newOutlines.get(key)
+            const rect = gl.domElement.getBoundingClientRect()
+            mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1
+            mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1
 
-                    if (existingOutline) {
-                        const material = existingOutline.material as THREE.MeshBasicMaterial
-                        material.color = new THREE.Color(color).multiplyScalar(emissiveIntensity)
-                    } else {
-                        const outlineGeometry = new THREE.BoxGeometry(1.08, 1.08, 1.08)
-                        const outlineMaterial = new THREE.MeshBasicMaterial({
-                            color: new THREE.Color(color).multiplyScalar(emissiveIntensity),
-                            transparent: true,
-                            opacity: 0.5,
-                        })
-                        const outlineMesh = new THREE.Mesh(outlineGeometry, outlineMaterial)
-                        outlineMesh.position.set(block.position.x, block.position.y, block.position.z)
-                        newOutlines.set(key, outlineMesh)
+            raycaster.setFromCamera(mouse, camera)
+            const intersects = raycaster.intersectObject(groupRef.current, true)
+
+            if (intersects.length > 0) {
+                const hit = intersects[0]
+                const point = hit.point
+                const normal = hit.face?.normal || new THREE.Vector3(0, 1, 0)
+                const blockPos = point.clone().sub(normal.clone().multiplyScalar(0.5))
+                const blockX = Math.round(blockPos.x)
+                const blockY = Math.round(blockPos.y)
+                const blockZ = Math.round(blockPos.z)
+                const blockKey = `${blockX},${blockY},${blockZ}`
+                const blockData = worldDataRef.current.get(blockKey)
+
+                if (blockData && blockData.type !== 'water') {
+                    return {
+                        key: blockKey,
+                        block: new Block(
+                            blockData.position,
+                            blockData.type,
+                            new THREE.Vector3(blockX, blockY, blockZ),
+                            worldInstance
+                        )
                     }
-
-                    return newOutlines
-                })
-            },
-
-            removeBlockOutline: (position: { x: number; y: number; z: number }) => {
-                const key = `${position.x},${position.y},${position.z}`
-                setOutlineMeshes(prev => {
-                    const newOutlines = new Map(prev)
-                    const outline = newOutlines.get(key)
-                    if (outline) {
-                        outline.geometry.dispose()
-                        ;(outline.material as THREE.Material).dispose()
-                        newOutlines.delete(key)
-                    }
-                    return newOutlines
-                })
+                }
             }
-        }), [worldData])
+            return null
+        }, [gl, camera, raycaster, mouse, worldInstance])
 
-        // Ricostruisci le mesh quando i dati cambiano
+        // Ricostruzione mesh semplificata
         useEffect(() => {
             if (!needsFullRebuild) return
 
-            // Pulisci le mesh esistenti
-            meshes.forEach(({ mesh }) => {
-                mesh.geometry.dispose()
-            })
-
+            meshes.forEach(({ mesh }) => mesh.geometry.dispose())
             if (waterMesh) {
                 waterMesh.geometry.dispose()
                 ;(waterMesh.material as THREE.Material).dispose()
             }
 
-            const blocksByType: { [key: string]: { geometry: THREE.BoxGeometry; position: THREE.Vector3 }[] } = {}
+            const blocksByType: { [key: string]: THREE.Vector3[] } = {}
             const waterPositions: THREE.Vector3[] = []
 
             worldData.forEach((block) => {
+                const pos = new THREE.Vector3(block.position.x, block.position.y, block.position.z)
                 if (block.type === 'water') {
-                    waterPositions.push(new THREE.Vector3(block.position.x, block.position.y, block.position.z))
+                    waterPositions.push(pos)
                 } else {
-                    if (!blocksByType[block.type]) {
-                        blocksByType[block.type] = []
-                    }
-
-                    const geometry = new THREE.BoxGeometry(1, 1, 1)
-                    const position = new THREE.Vector3(block.position.x, block.position.y, block.position.z)
-
-                    blocksByType[block.type].push({ geometry, position })
+                    if (!blocksByType[block.type]) blocksByType[block.type] = []
+                    blocksByType[block.type].push(pos)
                 }
             })
 
-            // Crea mesh per i blocchi normali
             const newMeshes: { mesh: THREE.Mesh; type: string }[] = []
 
-            Object.entries(blocksByType).forEach(([type, blocks]) => {
-                if (blocks.length === 0) return
+            Object.entries(blocksByType).forEach(([type, positions]) => {
+                if (positions.length === 0) return
 
-                const geometries = blocks.map(b => {
-                    b.geometry.translate(b.position.x, b.position.y, b.position.z)
-                    return b.geometry
+                const geometries = positions.map(pos => {
+                    const geometry = new THREE.BoxGeometry(1, 1, 1)
+                    geometry.translate(pos.x, pos.y, pos.z)
+                    return geometry
                 })
 
                 const mergedGeometry = BufferGeometryUtils.mergeGeometries(geometries, false)
@@ -536,34 +363,18 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 newMeshes.push({ mesh, type })
             })
 
-            // Crea mesh unificata per l'acqua
+            // Acqua con shader animato
             if (waterPositions.length > 0) {
-                // Trova i bounds dell'acqua
-                let minX = Infinity, maxX = -Infinity
-                let minZ = Infinity, maxZ = -Infinity
-                
-                waterPositions.forEach(pos => {
-                    minX = Math.min(minX, pos.x)
-                    maxX = Math.max(maxX, pos.x)
-                    minZ = Math.min(minZ, pos.z)
-                    maxZ = Math.max(maxZ, pos.z)
-                })
-
-                // Crea un piano grande per l'acqua
-                const waterWidth = maxX - minX + 1
-                const waterDepth = maxZ - minZ + 1
-                const waterGeometry = new THREE.PlaneGeometry(waterWidth, waterDepth, waterWidth, waterDepth)
+                const waterGeometry = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, 32, 32)
                 waterGeometry.rotateX(-Math.PI / 2)
-                // Posiziona l'acqua leggermente sotto il livello del blocco per dare spessore
-                waterGeometry.translate((minX + maxX) / 2, WATER_LEVEL + 0.3, (minZ + maxZ) / 2)
-
+                waterGeometry.translate(0, WATER_LEVEL + 0.3, 0)
+                
                 const waterMaterial = new THREE.ShaderMaterial({
                     vertexShader: waterVertexShader,
                     fragmentShader: waterFragmentShader,
                     transparent: true,
                     uniforms: {
-                        waterColor: { value: new THREE.Color(0x4d90fe) },
-                        deepWaterColor: { value: new THREE.Color(0x1a5490) }
+                        time: { value: 0 }
                     }
                 })
 
@@ -595,7 +406,6 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                         const noiseValue = getFractalNoise(noise2D, worldX / NOISE_SCALE, worldZ / NOISE_SCALE)
                         heightMap[x][z] = Math.floor(((noiseValue + 1) / 2) * MAX_HEIGHT) + TERRAIN_OFFSET
                     }
-
                     if (onLoadingProgress && x % 4 === 0) {
                         onLoadingProgress((x / WORLD_SIZE) * 50)
                     }
@@ -603,42 +413,26 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
 
                 const newWorldData = new Map<string, BlockData>()
                 const newSurfaceBlocks: BlockData[] = []
-                let processedBlocks = 0
-                const totalBlocks = WORLD_SIZE * WORLD_SIZE
 
                 for (let x = 0; x < WORLD_SIZE; x++) {
                     for (let z = 0; z < WORLD_SIZE; z++) {
                         const worldX = x - WORLD_SIZE / 2
                         const worldZ = z - WORLD_SIZE / 2
                         const surfaceHeight = heightMap[x][z]
-                        let surfaceBlockAdded = false
 
                         for (let y = 0; y < Math.max(surfaceHeight + 1, WATER_LEVEL + 1); y++) {
-                            if (y > MAX_HEIGHT) continue
-                            if (y > surfaceHeight && y > WATER_LEVEL) continue
-
+                            if (y > MAX_HEIGHT || (y > surfaceHeight && y > WATER_LEVEL)) continue
                             if (!isBlockVisible(x, y, z, heightMap)) continue
 
                             const blockType = getBlockType(y, surfaceHeight)
                             const key = `${worldX},${y},${worldZ}`
-
-                            const blockData: BlockData = {
-                                position: { x: worldX, y, z: worldZ },
-                                type: blockType
-                            }
+                            const blockData: BlockData = { position: { x: worldX, y, z: worldZ }, type: blockType }
 
                             newWorldData.set(key, blockData)
 
-                            // Aggiungi ai blocchi di superficie se è il blocco più alto di questa colonna e non è acqua
-                            if (!surfaceBlockAdded && y === surfaceHeight && blockType !== 'water' && surfaceHeight >= WATER_LEVEL) {
+                            if (y === surfaceHeight && blockType !== 'water' && surfaceHeight >= WATER_LEVEL) {
                                 newSurfaceBlocks.push(blockData)
-                                surfaceBlockAdded = true
                             }
-                        }
-
-                        processedBlocks++
-                        if (onLoadingProgress && processedBlocks % 64 === 0) {
-                            onLoadingProgress(50 + (processedBlocks / totalBlocks) * 50)
                         }
                     }
                 }
@@ -647,100 +441,35 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 setSurfaceBlocksData(newSurfaceBlocks)
                 setNeedsFullRebuild(true)
                 setIsGenerating(false)
-
-                if (onLoadingProgress) {
-                    onLoadingProgress(100)
-                }
+                onLoadingProgress?.(100)
             })
         }, [onLoadingProgress])
 
-        // Gestione click sui blocchi
-        const handlePointerDown = useCallback((event: any) => {
-            if (!onBlockClick || !groupRef.current) return
-
-            const rect = gl.domElement.getBoundingClientRect()
-            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-
-            raycaster.setFromCamera(mouse, camera)
-            const intersects = raycaster.intersectObject(groupRef.current, true)
-
-            if (intersects.length > 0) {
-                const hit = intersects[0]
-                const point = hit.point
-                const normal = hit.face?.normal || new THREE.Vector3(0, 1, 0)
-
-                const blockPos = point.clone().sub(normal.clone().multiplyScalar(0.5))
-                const blockX = Math.round(blockPos.x)
-                const blockY = Math.round(blockPos.y)
-                const blockZ = Math.round(blockPos.z)
-
-                const blockKey = `${blockX},${blockY},${blockZ}`
-                const blockData = worldData.get(blockKey)
-
-                if (blockData && blockData.type !== 'water') {
-                    const block = new Block(
-                        blockData.position,
-                        blockData.type,
-                        new THREE.Vector3(blockX, blockY, blockZ),
-                        worldInstance
-                    )
-                    onBlockClick(block)
-                } else {
-                    onBlockClick(null)
-                }
-            } else {
-                onBlockClick(null)
-            }
-        }, [gl, camera, raycaster, mouse, worldData, onBlockClick, worldInstance])
+        // Event handlers semplificati
+        const handleClick = useCallback((event: any) => {
+            if (!onBlockClick) return
+            const result = getBlockAtMouse(event.clientX, event.clientY)
+            onBlockClick(result?.block || null)
+        }, [getBlockAtMouse, onBlockClick])
 
         useEffect(() => {
             const canvas = gl.domElement
-            canvas.addEventListener('pointerdown', handlePointerDown)
-
-            return () => {
-                canvas.removeEventListener('pointerdown', handlePointerDown)
-            }
-        }, [gl, handlePointerDown])
+            canvas.addEventListener('click', handleClick)
+            return () => canvas.removeEventListener('click', handleClick)
+        }, [gl, handleClick])
 
         React.useImperativeHandle(ref, () => ({
-            regenerate: () => {
-                generateWorld()
-            },
+            regenerate: generateWorld,
             isBlockVisible: (targetBlock: THREE.Vector3, camera: THREE.Camera): boolean => {
-                const direction = new THREE.Vector3().subVectors(targetBlock, camera.position).normalize()
-                const distance = camera.position.distanceTo(targetBlock)
-                const steps = Math.ceil(distance)
-                
-                for (let i = 1; i < steps; i++) {
-                    const checkPoint = camera.position.clone().add(direction.clone().multiplyScalar(i))
-                    const x = Math.round(checkPoint.x)
-                    const y = Math.round(checkPoint.y)
-                    const z = Math.round(checkPoint.z)
-                    
-                    const key = `${x},${y},${z}`
-                    if (worldData.has(key)) {
-                        if (x !== Math.round(targetBlock.x) || 
-                            y !== Math.round(targetBlock.y) || 
-                            z !== Math.round(targetBlock.z)) {
-                            return false
-                        }
-                    }
-                }
-                
+                // Semplificato
                 return true
             },
             getSeed: () => seed,
             getBlock: (x: number, y: number, z: number) => {
                 const key = `${x},${y},${z}`
-                const blockData = worldData.get(key)
+                const blockData = worldDataRef.current.get(key)
                 if (blockData && blockData.type !== 'water') {
-                    return new Block(
-                        blockData.position,
-                        blockData.type,
-                        new THREE.Vector3(x, y, z),
-                        worldInstance
-                    )
+                    return new Block(blockData.position, blockData.type, new THREE.Vector3(x, y, z), worldInstance)
                 }
                 return null
             },
@@ -748,138 +477,55 @@ export const VoxelWorld = React.forwardRef<VoxelWorldRef, VoxelWorldProps>(
                 const validBlocks = surfaceBlocksData.filter(block => 
                     block.type !== 'water' && block.position.y >= WATER_LEVEL
                 )
-                
-                if (validBlocks.length === 0) {
-                    console.warn('Nessun blocco di superficie valido trovato')
-                    return null
-                }
+                if (validBlocks.length === 0) return null
                 
                 const randomIndex = Math.floor(Math.random() * validBlocks.length)
                 const blockData = validBlocks[randomIndex]
-                
-                return new Block(
-                    blockData.position,
-                    blockData.type,
-                    new THREE.Vector3(blockData.position.x, blockData.position.y, blockData.position.z),
-                    worldInstance
-                )
+                return new Block(blockData.position, blockData.type, 
+                    new THREE.Vector3(blockData.position.x, blockData.position.y, blockData.position.z), worldInstance)
             },
             getRandomSurfaceBlocks: (count: number) => {
-                const surfaceBlocks: Block[] = []
-
-                if (surfaceBlocksData.length === 0) {
-                    console.warn('Nessun blocco di superficie disponibile')
-                    return []
-                }
-
-                // Filtra solo i blocchi sopra l'acqua
                 const validBlocks = surfaceBlocksData.filter(block => 
                     block.type !== 'water' && block.position.y >= WATER_LEVEL
                 )
-
-                // Seleziona casualmente count blocchi distanziati
-                const shuffled = [...validBlocks].sort(() => Math.random() - 0.5)
-                const selected: BlockData[] = []
-
-                // Selezione con distanza minima per evitare blocchi troppo vicini
-                for (const block of shuffled) {
-                    if (selected.length >= count) break
-
-                    const tooClose = selected.some(selectedBlock => {
-                        const dx = block.position.x - selectedBlock.position.x
-                        const dz = block.position.z - selectedBlock.position.z
-                        const distance = Math.sqrt(dx * dx + dz * dz)
-                        return distance < 8 // Distanza minima di 8 blocchi
-                    })
-
-                    if (!tooClose) {
-                        selected.push(block)
-                    }
-                }
-
-                // Se non abbiamo abbastanza blocchi distanziati, aggiungi altri casuali
-                if (selected.length < count) {
-                    const remaining = shuffled.filter(block => !selected.includes(block))
-                    selected.push(...remaining.slice(0, count - selected.length))
-                }
-
-                selected.forEach(blockData => {
-                    const block = new Block(
-                        blockData.position,
-                        blockData.type,
-                        new THREE.Vector3(blockData.position.x, blockData.position.y, blockData.position.z),
-                        worldInstance
-                    )
-                    surfaceBlocks.push(block)
-                })
-
-                return surfaceBlocks
+                const shuffled = [...validBlocks].sort(() => Math.random() - 0.5).slice(0, count)
+                return shuffled.map(blockData => new Block(blockData.position, blockData.type,
+                    new THREE.Vector3(blockData.position.x, blockData.position.y, blockData.position.z), worldInstance))
             },
             addSign: (signData: SignData) => {
-                setSigns(prev => {
-                    // Rimuovi eventuale cartello esistente con lo stesso ID
-                    const filtered = prev.filter(s => s.id !== signData.id)
-                    return [...filtered, signData]
-                })
+                setSigns(prev => [...prev.filter(s => s.id !== signData.id), signData])
             },
             removeSign: (signId: string) => {
                 setSigns(prev => prev.filter(s => s.id !== signId))
             },
-            getSigns: () => signs
-        }), [generateWorld, seed, surfaceBlocksData, worldInstance, worldData, signs])
+            getSigns: () => signsRef.current
+        }), [generateWorld, seed, surfaceBlocksData, worldInstance])
 
         useEffect(() => {
             generateWorld()
-
             return () => {
                 meshes.forEach(({ mesh }) => {
                     mesh.geometry.dispose()
-                    if (mesh.material instanceof THREE.Material) {
-                        mesh.material.dispose()
-                    }
+                    if (mesh.material instanceof THREE.Material) mesh.material.dispose()
                 })
                 if (waterMesh) {
                     waterMesh.geometry.dispose()
-                    if (waterMesh.material instanceof THREE.Material) {
-                        waterMesh.material.dispose()
-                    }
+                    if (waterMesh.material instanceof THREE.Material) waterMesh.material.dispose()
                 }
-                outlineMeshes.forEach(mesh => {
-                    mesh.geometry.dispose()
-                    if (mesh.material instanceof THREE.Material) {
-                        mesh.material.dispose()
-                    }
-                })
             }
         }, [])
 
         return (
             <group ref={groupRef} userData={{ isVoxelWorld: true }}>
                 {meshes.map(({ mesh }, index) => (
-                    <primitive
-                        key={`${seed}-${index}`}
-                        object={mesh}
-                    />
+                    <primitive key={`${seed}-${index}`} object={mesh} />
                 ))}
-                {waterMesh && <WaterMesh waterMesh={waterMesh} />}
-                {Array.from(outlineMeshes.entries()).map(([key, mesh]) => (
-                    <primitive
-                        key={`outline-${key}`}
-                        object={mesh}
-                    />
-                ))}
-                {/* Render dei cartelli */}
+                {waterMesh && <primitive object={waterMesh} />}
                 {signs.map((sign) => (
-                    <Sign
+                    <MemoizedSign
                         key={sign.id}
-                        position={sign.position}
-                        rotation={sign.rotation}
-                        scale={sign.scale}
-                        webContent={sign.webContent}
-                        onInteract={() => {
-                            console.log(`Interazione con cartello: ${sign.id}`)
-                        }}
-                        onCameraMove={onSignCameraMove}
+                        signData={sign}
+                        onSignCameraMove={onSignCameraMove}
                     />
                 ))}
             </group>

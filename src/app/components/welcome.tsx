@@ -1,10 +1,5 @@
 import React, { useEffect, useState } from 'react';
-
-interface WelcomeProps {
-    hasStartedJourney: boolean;
-    isWorldLoaded: boolean;
-    setHasStartedJourney: (value: boolean) => void;
-}
+import { WelcomeProps } from '../types/types';
 
 export function Welcome({ hasStartedJourney,setHasStartedJourney, isWorldLoaded }: WelcomeProps) {
     return (
